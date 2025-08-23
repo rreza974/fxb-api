@@ -1,0 +1,13 @@
+name: keep-awake
+
+on:
+  schedule:
+    - cron: "*/14 * * * *"   # هر 14 دقیقه
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render API
+        run: curl -sSf https://fxb-api.onrender.com/api/health || exit 1
