@@ -116,6 +116,11 @@ app.get("/api/accounts", async (req, res) => {
   }
 });
 
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, portfolio: PORTFOLIO_ID, ts: Date.now() });
+});
+
 app.listen(PORT, () => {
   console.log("API running → http://localhost:" + PORT);
 });
+
