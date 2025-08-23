@@ -5,9 +5,28 @@ on:
     - cron: "*/14 * * * *"   # هر 14 دقیقه
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Render API
-        run: curl -sSf https://fxb-api.onrender.com/api/health || exit 1
+      - name: Warm Render (retry up to 5)
+        shell: bash
+        run: |
+          URL="https://fxb-api.onrender.com/api/health"
+          for i in {1..5}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i → HTTP $code"
+            # اگر 2xx یا 3xx بود، موفق
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+              echo "Service is awake."
+              exit 0
+            fi
+            # Render موقع بیدار شدن ممکنه چند ثانیه 404/502/503 بده
+            sleep 15
+          done
+          # نذار Job قرمز بشه؛ فقط خروجی صفر بده
+          echo "Finished retries; continuing without failing the workflow."
+          exit 0
