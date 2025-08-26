@@ -1,13 +1,11 @@
-// server.js — FXB API (Render/Node18) — اسکرپ FXBlue/Stats با فالو‌بک کامل + استخراج Peak drawdown
+// server.js — FXB API (Render/Node18) — اسکرپ FXBlue/Stats + فالو‌بک از صفحه اصلی برای Peak drawdown (همیشه با علامت منفی)
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
-
 const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-/* ---------------- HTTP client ---------------- */
 const http = axios.create({
   timeout: 25000,
   headers: {
@@ -18,7 +16,6 @@ const http = axios.create({
   },
 });
 
-/* ---------------- helpers ---------------- */
 const decodeHTML = (s = "") =>
   s
     .replace(/&nbsp;/g, " ")
@@ -30,25 +27,21 @@ const decodeHTML = (s = "") =>
 
 const toNum = (s) => {
   if (s == null) return null;
-  const cleaned = String(s)
-    .replace(/[\u2212\u2013\u2014]/g, "-")
-    .replace(/[()]/g, "")
-    .replace(/[,$%]/g, "")
-    .trim();
-  const n = parseFloat(cleaned);
+  const n = parseFloat(
+    String(s)
+      .replace(/[\u2212\u2013\u2014]/g, "-")
+      .replace(/[()]/g, "")
+      .replace(/[,$%]/g, "")
+      .trim()
+  );
   return Number.isFinite(n) ? n : null;
 };
 
 const stripTags = (s) => String(s).replace(/<[^>]+>/g, "");
 const compact = (s) =>
-  decodeHTML(String(s))
-    .replace(/[\u00A0]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
+  decodeHTML(String(s)).replace(/[\u00A0]/g, " ").replace(/\s+/g, " ").trim();
 const idx = (html, label) =>
   html.toLowerCase().indexOf(String(label).toLowerCase());
-
 const sliceWin = (html, start, win = 1200) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
@@ -62,15 +55,7 @@ function findAfter(html, label, { allowPercent = false, window = 600 } = {}) {
   const m = s.match(re);
   return m ? toNum(m[0]) : null;
 }
-function findHistoryRaw(html) {
-  const i = idx(html, "History");
-  if (i < 0) return null;
-  const s = sliceWin(html, i, 400);
-  const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
-  return m ? { value: toNum(m[1]), unit: String(m[2]).toLowerCase() } : null;
-}
 
-/* ------ parse table rows ------ */
 function extractRowsFromTable(tableHtml) {
   const rows = [];
   const trRe = /<tr\b[\s\S]*?<\/tr>/gi;
@@ -80,65 +65,50 @@ function extractRowsFromTable(tableHtml) {
     const cells = [];
     let m;
     while ((m = tdRe.exec(tr))) {
-      const raw = stripTags(m[1]);
-      const txt = compact(raw);
+      const txt = compact(stripTags(m[1]));
       cells.push(txt);
     }
     if (cells.length) rows.push(cells);
   }
   return rows;
 }
+
 function extractAllTables(html) {
   const out = [];
   const tableRe = /<table\b[\s\S]*?<\/table>/gi;
   const headingRe = /<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi;
   const captionRe = /<caption[^>]*>([\s\S]*?)<\/caption>/i;
-
   const matches = Array.from(html.matchAll(tableRe));
   for (const m of matches) {
     const tableHtml = m[0];
     const start = m.index || 0;
-
-    let title = null;
     const cap = tableHtml.match(captionRe);
-    if (cap && cap[1]) {
-      title = compact(stripTags(cap[1]));
-    } else {
+    let title = null;
+    if (cap && cap[1]) title = compact(stripTags(cap[1]));
+    else {
       const prev = html.slice(Math.max(0, start - 1200), start);
       const heads = Array.from(prev.matchAll(headingRe));
       if (heads.length) title = compact(stripTags(heads[heads.length - 1][1]));
     }
-
     const rows = extractRowsFromTable(tableHtml);
     if (!rows.length) continue;
-
     const headerGuess =
-      /<th\b/i.test(tableHtml) ||
-      rows[0].every((c) => toNum(c) === null && c !== "");
-
+      /<th\b/i.test(tableHtml) || rows[0].every((c) => toNum(c) === null && c !== "");
     let headers = [];
     let body = rows;
     if (headerGuess) {
       headers = rows[0];
       body = rows.slice(1);
     }
-
     out.push({ index: start, title: title || null, headers, rows: body });
   }
   out.sort((a, b) => a.index - b.index);
   return out;
 }
 
-/* ------ table helpers ------ */
 function findRow(rows, re) {
   const R = typeof re === "string" ? new RegExp("^" + re + "$", "i") : re;
   return rows.find((r) => r[0] && R.test(r[0])) || null;
-}
-function findLabeledNumber(rows, labelRe) {
-  const r = findRow(rows, labelRe);
-  if (!r) return null;
-  const v = r[1] ?? r[0] ?? null;
-  return v == null ? null : toNum(String(v).replace("%", ""));
 }
 function findLabeledPercent(rows, labelRe) {
   const r = findRow(rows, labelRe);
@@ -146,202 +116,106 @@ function findLabeledPercent(rows, labelRe) {
   const v = r[1] ?? r[0] ?? null;
   return v == null ? null : toNum(String(v).replace("%", ""));
 }
-function findHistoryInRows(rows) {
-  const r = findRow(rows, /history/i);
-  if (r) {
-    const txt = r.slice(1).join(" ") || r[0];
-    const m = String(txt).match(
-      /(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i
-    );
-    if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
-  }
-  for (const rr of rows) {
-    for (const c of rr) {
-      const m = String(c).match(
-        /(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i
-      );
-      if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
-    }
-  }
-  return null;
-}
-
-function findTriplet(rows, labelRe) {
+function findLabeledNumber(rows, labelRe) {
   const r = findRow(rows, labelRe);
   if (!r) return null;
-  const nums = r.slice(1).map((c) => toNum(c)).filter((x) => x != null);
-  if (nums.length < 3) return null;
-  const [a, b, c] = nums;
-  return { a, b, c };
-}
-function parseBankedProfitsFromTables(tables) {
-  const tgt = tables.find((t) =>
-    /banked profits per day\/week\/month\/trade/i.test(t.title || "")
-  );
-  if (!tgt) return null;
-  const map = {
-    days: /days?/i,
-    weeks: /weeks?/i,
-    months: /months?/i,
-    closedTrades: /closed trades?/i,
-  };
-  const out = {};
-  for (const key of Object.keys(map)) {
-    const row = findRow(tgt.rows, map[key]);
-    if (!row) {
-      out[key] = null;
-      continue;
-    }
-    const winning = toNum(row[1]);
-    const losing = toNum(row[2]);
-    let winLossPct = null;
-    for (let i = 1; i < row.length; i++) {
-      if (/%/.test(row[i])) {
-        winLossPct = toNum(row[i]);
-        break;
-      }
-    }
-    const best = toNum(row[4] ?? row[3]);
-    const worst = toNum(row[5] ?? row[4]);
-    const bestSeq = toNum(row[6] ?? row[5]);
-    const worstSeq = toNum(row[7] ?? row[6]);
-    out[key] = {
-      winning: winning ?? null,
-      losing: losing ?? null,
-      winLossPct: winLossPct ?? null,
-      best: best ?? null,
-      worst: worst ?? null,
-      bestSeq: bestSeq ?? null,
-      worstSeq: worstSeq ?? null,
-    };
-  }
-  return out;
-}
-function parseClosedStatsFromTables(tables) {
-  const tgt = tables.find((t) => /stats on closed trades/i.test(t.title || ""));
-  if (!tgt) return null;
-
-  const keys = [
-    { key: "winners", re: /winners?/i },
-    { key: "losers", re: /losers?/i },
-    { key: "all", re: /all trades?/i },
-  ];
-  const out = {};
-  for (const k of keys) {
-    const row = findRow(tgt.rows, k.re);
-    if (!row) {
-      out[k.key] = null;
-      continue;
-    }
-    const nums = row.slice(1).map(toNum);
-    out[k.key] = {
-      trades: nums[0] ?? null,
-      profit: nums[1] ?? null,
-      avgCash: nums[2] ?? null,
-      avgPips: nums[3] ?? null,
-      avgLengthHours: nums[4] ?? null,
-      cashPerHour: nums[5] ?? null,
-      pipsPerHour: nums[6] ?? null,
-      longSeq: nums[7] ?? null,
-    };
-  }
-  return out;
+  const v = r[1] ?? r[0] ?? null;
+  return v == null ? null : toNum(v);
 }
 
-/* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
-  const url = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
-  const { data: htmlRaw } = await http.get(url);
-  const html = String(htmlRaw);
+  // 1) صفحه Stats
+  const statsUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
+  const { data: statsHtmlRaw } = await http.get(statsUrl);
+  const statsHtml = String(statsHtmlRaw);
+  const statsTables = extractAllTables(statsHtml);
+  const statsRows = statsTables.flatMap((t) => t.rows);
 
-  const tables = extractAllTables(html);
-  const allRows = tables.flatMap((t) => t.rows);
+  // 2) صفحه Overview اصلی
+  const overviewUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}`;
+  const { data: ovHtmlRaw } = await http.get(overviewUrl);
+  const ovHtml = String(ovHtmlRaw);
+  const ovTables = extractAllTables(ovHtml);
+  const ovRows = ovTables.flatMap((t) => t.rows);
 
-  const overview = {
-    weeklyReturn:
-      findLabeledPercent(allRows, /weekly return/i) ??
-      findAfter(html, "Weekly return", { allowPercent: true }),
-    monthlyReturn:
-      findLabeledPercent(allRows, /monthly return/i) ??
-      findAfter(html, "Monthly return", { allowPercent: true }),
-    profitFactor:
-      findLabeledNumber(allRows, /profit factor/i) ??
-      findAfter(html, "Profit factor"),
-    // NEW: Peak drawdown
-    peakDrawdown:
-      findLabeledPercent(allRows, /peak drawdown/i) ??
-      findAfter(html, "Peak drawdown", { allowPercent: true }),
-    history: findHistoryInRows(allRows) ?? findHistoryRaw(html),
-    currency: (() => {
-      const r = findRow(allRows, /currency/i);
-      if (r) {
-        const m = String(r[1] || r[0] || "").match(/\b([A-Z]{3,4})\b/);
-        return m ? m[1] : null;
-      }
-      return null;
-    })(),
+  // ---- Overview fields
+  let weeklyReturn =
+    findLabeledPercent(statsRows, /weekly return/i) ??
+    findAfter(statsHtml, "Weekly return", { allowPercent: true });
+  let monthlyReturn =
+    findLabeledPercent(statsRows, /monthly return/i) ??
+    findAfter(statsHtml, "Monthly return", { allowPercent: true });
+
+  const profitFactor =
+    findLabeledNumber(statsRows, /profit factor/i) ??
+    findAfter(statsHtml, "Profit factor");
+
+  // Peak drawdown: اول از صفحه Stats، اگر نبود از صفحه Overview بخوان
+  let peakDrawdown =
+    findLabeledPercent(statsRows, /peak drawdown/i) ??
+    findAfter(statsHtml, "Peak drawdown", { allowPercent: true }) ??
+    findLabeledPercent(ovRows, /peak drawdown/i) ??
+    findAfter(ovHtml, "Peak drawdown", { allowPercent: true });
+
+  // اگر Peak drawdown پیدا شد، همیشه منفی‌اش کن (برای نمایش «-99.7%»)
+  if (typeof peakDrawdown === "number") peakDrawdown = -Math.abs(peakDrawdown);
+
+  // Returns
+  const totalReturn =
+    findLabeledPercent(statsRows, /total return/i) ??
+    findAfter(statsHtml, "Total return", { allowPercent: true });
+  const bankedReturn =
+    findLabeledPercent(statsRows, /banked return/i) ??
+    findAfter(statsHtml, "Banked return", { allowPercent: true });
+  const perDay =
+    findLabeledPercent(statsRows, /per day/i) ??
+    findAfter(statsHtml, "Per day", { allowPercent: true });
+  const perWeek =
+    findLabeledPercent(statsRows, /per week/i) ??
+    findAfter(statsHtml, "Per week", { allowPercent: true });
+  const perMonth =
+    findLabeledPercent(statsRows, /per month/i) ??
+    findAfter(statsHtml, "Per month", { allowPercent: true });
+
+  // Deposits / Profit & Loss (از جدول‌ها)
+  const triplet = (rows, label) => {
+    const r = findRow(rows, label);
+    if (!r) return null;
+    const nums = r.slice(1).map(toNum).filter((x) => x != null);
+    if (nums.length < 3) return null;
+    return { a: nums[0], b: nums[1], c: nums[2] };
   };
-
-  const returns = {
-    totalReturn:
-      findLabeledPercent(allRows, /total return/i) ??
-      findAfter(html, "Total return", { allowPercent: true }),
-    bankedReturn:
-      findLabeledPercent(allRows, /banked return/i) ??
-      findAfter(html, "Banked return", { allowPercent: true }),
-    perDay:
-      findLabeledPercent(allRows, /per day/i) ??
-      findAfter(html, "Per day", { allowPercent: true }),
-    perWeek:
-      findLabeledPercent(allRows, /per week/i) ??
-      findAfter(html, "Per week", { allowPercent: true }),
-    perMonth:
-      findLabeledPercent(allRows, /per month/i) ??
-      findAfter(html, "Per month", { allowPercent: true }),
-  };
-
-  const credits = findTriplet(allRows, /^credits$/i);
-  const totals = findTriplet(allRows, /^total$/i);
-  const bankedPL = findTriplet(allRows, /banked trades?/i);
-  const openPL = findTriplet(allRows, /open trades?/i);
-  const deposits = {
-    credits: credits
-      ? { deposits: credits.a, withdrawals: credits.b, net: credits.c }
-      : null,
-    bankedTrades: bankedPL
-      ? { profit: bankedPL.a, loss: bankedPL.b, net: bankedPL.c }
-      : null,
-    openTrades: openPL
-      ? { profit: openPL.a, loss: openPL.b, net: openPL.c }
-      : null,
-    total: totals
-      ? { deposits: totals.a, withdrawals: totals.b, net: totals.c }
-      : null,
-  };
-
-  const bankedProfits = parseBankedProfitsFromTables(tables);
-  const closedStats = parseClosedStatsFromTables(tables);
-
-  const rawTables = tables.map((t) => ({
-    title: t.title,
-    headers: t.headers,
-    rows: t.rows,
-  }));
+  const credits = triplet(statsRows, /^credits$/i);
+  const banked = triplet(statsRows, /banked trades?/i);
+  const open   = triplet(statsRows, /open trades?/i);
+  const totals = triplet(statsRows, /^total$/i);
 
   return {
     user,
-    overview,
-    returns,
-    deposits,
-    bankedProfits,
-    closedStats,
-    tables: rawTables,
+    overview: {
+      weeklyReturn,
+      monthlyReturn,
+      profitFactor,
+      peakDrawdown, // مهم
+    },
+    returns: {
+      totalReturn,
+      bankedReturn,
+      perDay,
+      perWeek,
+      perMonth,
+    },
+    deposits: {
+      credits: credits ? { deposits: credits.a, withdrawals: credits.b, net: credits.c } : null,
+      bankedTrades: banked ? { profit: banked.a, loss: banked.b, net: banked.c } : null,
+      openTrades: open ? { profit: open.a, loss: open.b, net: open.c } : null,
+      total: totals ? { deposits: totals.a, withdrawals: totals.b, net: totals.c } : null,
+    },
     source: "fxblue-scrape",
     fetchedAt: Date.now(),
   };
 }
 
-/* ---------------- REST ---------------- */
 app.get("/api/fxblue/stats", async (req, res) => {
   try {
     const u = String(req.query.u || "").trim();
@@ -349,12 +223,9 @@ app.get("/api/fxblue/stats", async (req, res) => {
     const data = await scrapeFxBlueStats(u);
     res.json(data);
   } catch (e) {
-    res
-      .status(500)
-      .json({ error: true, message: e.message || "scrape error (fxblue)" });
+    res.status(500).json({ error: true, message: e.message || "scrape error" });
   }
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
 app.listen(PORT, () => console.log("FXB API on :" + PORT));
