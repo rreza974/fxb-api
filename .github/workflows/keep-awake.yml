@@ -2,7 +2,7 @@ name: keep-awake
 
 on:
   schedule:
-    - cron: "*/14 * * * *"   # هر 14 دقیقه
+    - cron: "*/7 * * * *"    # هر 7 دقیقه
   workflow_dispatch:
 
 permissions:
