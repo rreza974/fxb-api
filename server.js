@@ -1,4 +1,4 @@
-// server.js — FXB API (Render/Node18) — اسکرپ FXBlue/Stats با فالو‌بکِ مطمئن برای Profit factor و History
+// server.js — FXB API (Render/Node18) — اسکرپ FXBlue/Stats با فالو‌بک کامل + استخراج Peak drawdown
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -31,9 +31,9 @@ const decodeHTML = (s = "") =>
 const toNum = (s) => {
   if (s == null) return null;
   const cleaned = String(s)
-    .replace(/[\u2212\u2013\u2014]/g, "-") // minus/en/em → -
-    .replace(/[()]/g, "")                  // (1,234) → 1,234
-    .replace(/[,$%]/g, "")                 // $,%,,
+    .replace(/[\u2212\u2013\u2014]/g, "-")
+    .replace(/[()]/g, "")
+    .replace(/[,$%]/g, "")
     .trim();
   const n = parseFloat(cleaned);
   return Number.isFinite(n) ? n : null;
@@ -52,7 +52,6 @@ const idx = (html, label) =>
 const sliceWin = (html, start, win = 1200) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
-/* ------ find numeric right after label anywhere in HTML ------ */
 function findAfter(html, label, { allowPercent = false, window = 600 } = {}) {
   const i = idx(html, label);
   if (i < 0) return null;
@@ -130,7 +129,7 @@ function extractAllTables(html) {
   return out;
 }
 
-/* ------ convenience finders on table rows ------ */
+/* ------ table helpers ------ */
 function findRow(rows, re) {
   const R = typeof re === "string" ? new RegExp("^" + re + "$", "i") : re;
   return rows.find((r) => r[0] && R.test(r[0])) || null;
@@ -167,7 +166,6 @@ function findHistoryInRows(rows) {
   return null;
 }
 
-/* ------ other tables we already used ------ */
 function findTriplet(rows, labelRe) {
   const r = findRow(rows, labelRe);
   if (!r) return null;
@@ -181,7 +179,6 @@ function parseBankedProfitsFromTables(tables) {
     /banked profits per day\/week\/month\/trade/i.test(t.title || "")
   );
   if (!tgt) return null;
-
   const map = {
     days: /days?/i,
     weeks: /weeks?/i,
@@ -260,7 +257,6 @@ async function scrapeFxBlueStats(user) {
   const tables = extractAllTables(html);
   const allRows = tables.flatMap((t) => t.rows);
 
-  // Overview with robust fallbacks
   const overview = {
     weeklyReturn:
       findLabeledPercent(allRows, /weekly return/i) ??
@@ -271,9 +267,12 @@ async function scrapeFxBlueStats(user) {
     profitFactor:
       findLabeledNumber(allRows, /profit factor/i) ??
       findAfter(html, "Profit factor"),
+    // NEW: Peak drawdown
+    peakDrawdown:
+      findLabeledPercent(allRows, /peak drawdown/i) ??
+      findAfter(html, "Peak drawdown", { allowPercent: true }),
     history: findHistoryInRows(allRows) ?? findHistoryRaw(html),
     currency: (() => {
-      // اگر لازم شد می‌توانید در آینده اضافه کنید؛ در UI شما همیشه USD است
       const r = findRow(allRows, /currency/i);
       if (r) {
         const m = String(r[1] || r[0] || "").match(/\b([A-Z]{3,4})\b/);
@@ -283,7 +282,6 @@ async function scrapeFxBlueStats(user) {
     })(),
   };
 
-  // Returns
   const returns = {
     totalReturn:
       findLabeledPercent(allRows, /total return/i) ??
@@ -302,7 +300,6 @@ async function scrapeFxBlueStats(user) {
       findAfter(html, "Per month", { allowPercent: true }),
   };
 
-  // Deposits / PL
   const credits = findTriplet(allRows, /^credits$/i);
   const totals = findTriplet(allRows, /^total$/i);
   const bankedPL = findTriplet(allRows, /banked trades?/i);
@@ -322,11 +319,9 @@ async function scrapeFxBlueStats(user) {
       : null,
   };
 
-  // Extra tables
   const bankedProfits = parseBankedProfitsFromTables(tables);
   const closedStats = parseClosedStatsFromTables(tables);
 
-  // Raw tables (for UI)
   const rawTables = tables.map((t) => ({
     title: t.title,
     headers: t.headers,
@@ -360,7 +355,6 @@ app.get("/api/fxblue/stats", async (req, res) => {
   }
 });
 
-// health
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.listen(PORT, () => console.log("FXB API on :" + PORT));
