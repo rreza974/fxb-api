@@ -1,4 +1,4 @@
-// server.js — FXB API (Render/Node18) — FXBlue/Stats full scrape (DOM-less)
+// server.js — FXB API (Render/Node18) — اسکرپ کامل‌تر FXBlue/Stats + خروجی همهٔ جدول‌ها
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -31,14 +31,15 @@ const decodeHTML = (s = "") =>
 const toNum = (s) => {
   if (s == null) return null;
   const cleaned = String(s)
-    .replace(/[\u2212\u2013\u2014]/g, "-") // minus/en/em dashes → -
-    .replace(/[()]/g, "") // handle (1,234)
-    .replace(/[,$%]/g, "")
+    .replace(/[\u2212\u2013\u2014]/g, "-") // minus/en/em → -
+    .replace(/[()]/g, "")                  // (1,234) → 1,234
+    .replace(/[,$%]/g, "")                 // $,%,,
     .trim();
   const n = parseFloat(cleaned);
   return Number.isFinite(n) ? n : null;
 };
 
+const stripTags = (s) => String(s).replace(/<[^>]+>/g, "");
 const compact = (s) =>
   decodeHTML(String(s))
     .replace(/[\u00A0]/g, " ")
@@ -51,67 +52,105 @@ const idx = (html, label) =>
 const sliceWin = (html, start, win = 1200) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
-/** extract table rows as array of [cells[]] (text-only), very forgiving */
-function extractRows(html) {
+/* ---- خواندن همهٔ ردیف‌های یک <table> به‌شکل آرایهٔ سلول‌ها ---- */
+function extractRowsFromTable(tableHtml) {
   const rows = [];
   const trRe = /<tr\b[\s\S]*?<\/tr>/gi;
   const tdRe = /<(?:th|td)\b[^>]*>([\s\S]*?)<\/(?:th|td)>/gi;
-  const tagRe = /<[^>]+>/g;
-
-  const trMatches = html.match(trRe) || [];
+  const trMatches = tableHtml.match(trRe) || [];
   for (const tr of trMatches) {
     const cells = [];
     let m;
     while ((m = tdRe.exec(tr))) {
-      const raw = m[1].replace(tagRe, "");
+      const raw = stripTags(m[1]);
       const txt = compact(raw);
-      cells.push(txt);
+      if (txt !== "") cells.push(txt);
+      else cells.push(""); // برای حفظ ستون‌ها
     }
     if (cells.length) rows.push(cells);
   }
   return rows;
 }
 
-/** find first row whose first cell matches regex (case-insensitive) */
+/* ---- پیدا کردن جدول‌ها به‌همراه عنوان نزدیکش (h1/h2/h3/caption) ---- */
+function extractAllTables(html) {
+  const out = [];
+  const tableRe = /<table\b[\s\S]*?<\/table>/gi;
+  const headingRe = /<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi;
+  const captionRe = /<caption[^>]*>([\s\S]*?)<\/caption>/i;
+
+  const matches = Array.from(html.matchAll(tableRe));
+  for (const m of matches) {
+    const tableHtml = m[0];
+    const start = m.index || 0;
+
+    // عنوان: اول کپشن اگر بود، وگرنه نزدیک‌ترین h1/h2/h3 قبل از جدول
+    let title = null;
+    const cap = tableHtml.match(captionRe);
+    if (cap && cap[1]) {
+      title = compact(stripTags(cap[1]));
+    } else {
+      const prev = html.slice(Math.max(0, start - 1200), start);
+      const heads = Array.from(prev.matchAll(headingRe));
+      if (heads.length) {
+        title = compact(stripTags(heads[heads.length - 1][1]));
+      }
+    }
+
+    const rows = extractRowsFromTable(tableHtml);
+    if (!rows.length) continue;
+
+    // تشخیص هدربار: اگر ردیف اول <th> داشته؛ یا همهٔ سلول‌ها غیرعددی باشند
+    const headerGuess =
+      /<th\b/i.test(tableHtml) ||
+      rows[0].every((c) => toNum(c) === null && c !== "");
+
+    let headers = [];
+    let body = rows;
+    if (headerGuess) {
+      headers = rows[0];
+      body = rows.slice(1);
+    }
+
+    out.push({
+      index: start,
+      title: title || null,
+      headers,
+      rows: body,
+    });
+  }
+
+  // مرتب‌سازی بر اساس ترتیب در HTML
+  out.sort((a, b) => a.index - b.index);
+  return out;
+}
+
+/* ---- یابنده‌های سادهٔ مقدار با تکیه بر ردیف/برچسب ---- */
 function findRow(rows, re) {
   const R = typeof re === "string" ? new RegExp("^" + re + "$", "i") : re;
   return rows.find((r) => r[0] && R.test(r[0])) || null;
 }
-
-/** find a (label, value) where label is in first cell; return numeric value from next cell */
 function findLabeledNumber(rows, labelRe) {
-  const row = findRow(rows, labelRe);
-  if (!row) return null;
-  // try second cell; if absent, try to parse from first
-  if (row.length > 1) {
-    const v = row[1];
-    // allow values like "35.4%" or "$10,000"
-    return toNum(v);
-  }
-  return toNum(row[0]);
+  const r = findRow(rows, labelRe);
+  if (!r) return null;
+  const v = r[1] ?? r[0] ?? null;
+  return v == null ? null : toNum(String(v).replace("%", ""));
 }
-
-/** find percentage in second cell */
 function findLabeledPercent(rows, labelRe) {
-  const row = findRow(rows, labelRe);
-  if (!row) return null;
-  const v = row[1] || row[0] || "";
-  return toNum(String(v).replace("%", ""));
+  const r = findRow(rows, labelRe);
+  if (!r) return null;
+  const v = r[1] ?? r[0] ?? null;
+  return v == null ? null : toNum(String(v).replace("%", ""));
 }
-
-/** find triplet row: returns {a,b,c} from the three numeric cells following label */
 function findTriplet(rows, labelRe) {
-  const row = findRow(rows, labelRe);
-  if (!row) return null;
-  const nums = row.slice(1).map(toNum).filter((x) => x != null);
+  const r = findRow(rows, labelRe);
+  if (!r) return null;
+  const nums = r.slice(1).map((c) => toNum(c)).filter((x) => x != null);
   if (nums.length < 3) return null;
   const [a, b, c] = nums;
   return { a, b, c };
 }
-
-/** find "History" like "5 days" anywhere */
-function findHistory(rows) {
-  // try a labeled row
+function findHistoryInRows(rows) {
   const r = findRow(rows, /history/i);
   if (r) {
     const txt = r.slice(1).join(" ") || r[0];
@@ -120,9 +159,9 @@ function findHistory(rows) {
     );
     if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
   }
-  // fallback: scan all cells
-  for (const r2 of rows) {
-    for (const c of r2) {
+  // fallback: اسکن همهٔ سلول‌ها
+  for (const rr of rows) {
+    for (const c of rr) {
       const m = String(c).match(
         /(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i
       );
@@ -132,8 +171,13 @@ function findHistory(rows) {
   return null;
 }
 
-/** parse Banked profits per day/week/month/trade table */
-function parseBankedProfits(rows) {
+/* ---- پارس جدول «Banked profits per day/week/month/trade» ---- */
+function parseBankedProfitsFromTables(tables) {
+  const tgt = tables.find((t) =>
+    /banked profits per day\/week\/month\/trade/i.test(t.title || "")
+  );
+  if (!tgt) return null;
+
   const map = {
     days: /days?/i,
     weeks: /weeks?/i,
@@ -142,15 +186,14 @@ function parseBankedProfits(rows) {
   };
   const out = {};
   for (const key of Object.keys(map)) {
-    const row = findRow(rows, map[key]);
+    const row = findRow(tgt.rows, map[key]);
     if (!row) {
       out[key] = null;
       continue;
     }
-    // Expected: [label, winning, losing, win/loss %, best, worst, best seq, worst seq]
+    // انتظار ستون‌ها: [label, winning, losing, win/loss %, best, worst, best seq, worst seq]
     const winning = toNum(row[1]);
     const losing = toNum(row[2]);
-    // Find a cell containing %
     let winLossPct = null;
     for (let i = 1; i < row.length; i++) {
       if (/%/.test(row[i])) {
@@ -175,8 +218,11 @@ function parseBankedProfits(rows) {
   return out;
 }
 
-/** parse Stats on closed trades table */
-function parseClosedStats(rows) {
+/* ---- پارس جدول «Stats on closed trades» ---- */
+function parseClosedStatsFromTables(tables) {
+  const tgt = tables.find((t) => /stats on closed trades/i.test(t.title || ""));
+  if (!tgt) return null;
+
   const keys = [
     { key: "winners", re: /winners?/i },
     { key: "losers", re: /losers?/i },
@@ -184,12 +230,12 @@ function parseClosedStats(rows) {
   ];
   const out = {};
   for (const k of keys) {
-    const row = findRow(rows, k.re);
+    const row = findRow(tgt.rows, k.re);
     if (!row) {
       out[k.key] = null;
       continue;
     }
-    // Expected order: Trades, Profit, Avg cash, Avg pips, Avg length(h), Cash/hr, Pips/hr, Long seq
+    // ترتیب ستون‌ها: Trades, Profit, Avg cash, Avg pips, Avg length(h), Cash/hr, Pips/hr, Long seq
     const nums = row.slice(1).map(toNum);
     out[k.key] = {
       trades: nums[0] ?? null,
@@ -205,45 +251,50 @@ function parseClosedStats(rows) {
   return out;
 }
 
-/* ---------------- scraper ---------------- */
+/* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
   const url = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
   const { data: htmlRaw } = await http.get(url);
   const html = String(htmlRaw);
-  const rows = extractRows(html);
 
-  // ----- Overview -----
+  // همهٔ جدول‌ها + عنوان‌شان
+  const tables = extractAllTables(html);
+
+  // جدول‌هایی که شامل «Overview/Returns/Deposits» هستند معمولاً در یکی از اولین جدول‌ها قرار دارند
+  // ما به‌جای وابستگی سفت‌وسخت به جایگاه، از برچسب ردیف‌ها استفاده می‌کنیم:
+  const allRows = tables.flatMap((t) => t.rows);
+
   const overview = {
-    weeklyReturn: findLabeledPercent(rows, /weekly return/i),
-    monthlyReturn: findLabeledPercent(rows, /monthly return/i),
-    profitFactor: findLabeledNumber(rows, /profit factor/i),
-    history: findHistory(rows),
+    weeklyReturn: findLabeledPercent(allRows, /weekly return/i),
+    monthlyReturn: findLabeledPercent(allRows, /monthly return/i),
+    profitFactor: findLabeledNumber(allRows, /profit factor/i),
+    history: findHistoryInRows(allRows),
     currency: (() => {
-      const r = findRow(rows, /currency/i);
+      const r = findRow(allRows, /currency/i);
       if (!r) return null;
+      // سلول بعدی یا خود متن
       const cell = r[1] || r[0] || "";
       const m = String(cell).match(/\b([A-Z]{3,4})\b/);
       return m ? m[1] : compact(cell);
     })(),
-    equity: findLabeledNumber(rows, /^equity$/i),
-    balance: findLabeledNumber(rows, /^balance$/i),
-    floatingPL: findLabeledNumber(rows, /floating\s*P\/L/i),
+    equity: findLabeledNumber(allRows, /^equity$/i),
+    balance: findLabeledNumber(allRows, /^balance$/i),
+    floatingPL: findLabeledNumber(allRows, /floating\s*P\/L/i),
   };
 
-  // ----- Returns -----
   const returns = {
-    totalReturn: findLabeledPercent(rows, /total return/i),
-    bankedReturn: findLabeledPercent(rows, /banked return/i),
-    perDay: findLabeledPercent(rows, /per day/i),
-    perWeek: findLabeledPercent(rows, /per week/i),
-    perMonth: findLabeledPercent(rows, /per month/i),
+    totalReturn: findLabeledPercent(allRows, /total return/i),
+    bankedReturn: findLabeledPercent(allRows, /banked return/i),
+    perDay: findLabeledPercent(allRows, /per day/i),
+    perWeek: findLabeledPercent(allRows, /per week/i),
+    perMonth: findLabeledPercent(allRows, /per month/i),
   };
 
-  // ----- Deposits / Profit & Loss -----
-  const credits = findTriplet(rows, /^credits$/i);
-  const totals = findTriplet(rows, /^total$/i);
-  const bankedPL = findTriplet(rows, /banked trades?/i);
-  const openPL = findTriplet(rows, /open trades?/i);
+  // Deposits / PL: دنبال ردیف‌های سه‌تایی
+  const credits = findTriplet(allRows, /^credits$/i);
+  const totals = findTriplet(allRows, /^total$/i);
+  const bankedPL = findTriplet(allRows, /banked trades?/i);
+  const openPL = findTriplet(allRows, /open trades?/i);
   const deposits = {
     credits: credits
       ? { deposits: credits.a, withdrawals: credits.b, net: credits.c }
@@ -259,11 +310,16 @@ async function scrapeFxBlueStats(user) {
       : null,
   };
 
-  // ----- Banked profits per day/week/month/trade -----
-  const bankedProfits = parseBankedProfits(rows);
+  const bankedProfits = parseBankedProfitsFromTables(tables);
+  const closedStats = parseClosedStatsFromTables(tables);
 
-  // ----- Stats on closed trades -----
-  const closedStats = parseClosedStats(rows);
+  // علاوه‌بر این‌ها، «تمام جدول‌های صفحه» را هم به‌صورت خام برمی‌گردانیم
+  // تا هر داده‌ای که روی صفحه هست، در اختیار شما باشد.
+  const rawTables = tables.map((t) => ({
+    title: t.title,
+    headers: t.headers,
+    rows: t.rows,
+  }));
 
   return {
     user,
@@ -272,6 +328,7 @@ async function scrapeFxBlueStats(user) {
     deposits,
     bankedProfits,
     closedStats,
+    tables: rawTables, // همهٔ جدول‌ها به‌ترتیب ظاهرشدن در صفحه
     source: "fxblue-scrape",
     fetchedAt: Date.now(),
   };
