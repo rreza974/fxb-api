@@ -1,6 +1,7 @@
 // server.js — FXB API (Render/Node18)
 // اسکرپ FXBlue: /users/<u>/stats + فالو‌بک از /users/<u>
-// + استخراج robust برای Account type (Demo/Real)
+// خروجی شامل: overview.weeklyReturn/monthlyReturn/profitFactor/peakDrawdown/history/accountType
+// returns.* و deposits.* هم برگردانده می‌شود.
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -46,11 +47,10 @@ const compact = (s) =>
   decodeHTML(String(s)).replace(/[\u00A0]/g, " ").replace(/\s+/g, " ").trim();
 const idx = (html, label) =>
   html.toLowerCase().indexOf(String(label).toLowerCase());
-const sliceWin = (html, start, win = 1200) =>
+const sliceWin = (html, start, win = 1400) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
 function findAfter(html, label, { allowPercent = false, window = 1000 } = {}) {
-  // ⬅️ پنجره را بزرگ‌تر کردیم تا «Demo/Real» داخل محدوده باشد
   const i = idx(html, label);
   if (i < 0) return null;
   const s = sliceWin(html, i, window);
@@ -141,21 +141,30 @@ function findHistoryFrom(rows) {
   }
   return null;
 }
-function findAccountType(rows, html){
-  // ۱) از جدول‌ها (اگر «Account type» سطری باشد)
+
+/* --- استخراج مقاوم Account type --- */
+function guessAccountTypeFrom(html, rows) {
+  // ۱) اگر در جدول آمده باشد
   const r = findRow(rows, /account\s*type/i);
-  if (r){
-    const text = (r[1] || r[0] || "").toLowerCase();
-    if (/demo/i.test(text)) return "demo";
-    if (/real/i.test(text)) return "real";
+  if (r) {
+    const text = (r.slice(1).join(" ") || r[0] || "").toLowerCase();
+    if (/\bdemo\b/i.test(text)) return "demo";
+    if (/\breal\b/i.test(text)) return "real";
   }
-  // ۲) فالو‌بک: جست‌وجوی آزاد نزدیک «Account type» در HTML
+  // ۲) جست‌وجو در متنِ صفحه (پس از حذف تگ‌ها)
+  const plain = compact(stripTags(html)).toLowerCase();
+  let m = plain.match(/account\s*type\s*:\s*(demo|real)/i);
+  if (m && m[1]) return m[1].toLowerCase();
+  // ۳) نزدیک‌محله‌ی برچسب در HTML خام
   const i = idx(html, "Account type");
-  if (i >= 0){
-    const s = sliceWin(html, i, 1000); // ⬅️ پنجرهٔ بزرگ‌تر
-    if (/demo/i.test(s)) return "demo";
-    if (/real/i.test(s)) return "real";
+  if (i >= 0) {
+    const win = sliceWin(html, i, 1600); // پنجره بزرگ
+    if (/demo/i.test(win)) return "demo";
+    if (/real/i.test(win)) return "real";
   }
+  // ۴) فالو‌بک ساده
+  if (/\bdemo\b/i.test(plain)) return "demo";
+  if (/\breal\b/i.test(plain)) return "real";
   return null;
 }
 
@@ -217,8 +226,9 @@ async function scrapeFxBlueStats(user) {
 
   // Account type (robust)
   const accountType =
-    findAccountType(ovRows, ovHtml) ??
-    findAccountType(statsRows, statsHtml) || null; // 'demo' | 'real' | null
+    guessAccountTypeFrom(ovHtml, ovRows) ??
+    guessAccountTypeFrom(statsHtml, statsRows) ||
+    null; // 'demo' | 'real' | null
 
   // Returns
   const totalReturn =
