@@ -1,14 +1,13 @@
-// server.js — FXB API (Render/Node18)
+// server.js — FXB API (Render/Node18) — FXBlue/Stats (overview + returns + deposits + banked-profits + closed-trades)
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 
 const app = express();
 app.use(cors());
-
 const PORT = process.env.PORT || 3000;
 
-// ---------- HTTP client ----------
+/* ---------------- HTTP client ---------------- */
 const http = axios.create({
   timeout: 25000,
   headers: {
@@ -19,52 +18,68 @@ const http = axios.create({
   },
 });
 
-// helpers
-const compact = (s) => (s || "").replace(/\s+/g, " ").trim();
+/* ---------------- helpers ---------------- */
 const toNum = (s) => {
   if (s == null) return null;
   const n = parseFloat(String(s).replace(/[, %]/g, ""));
   return isFinite(n) ? n : null;
 };
+const compact = (s) => (s || "").replace(/\s+/g, " ").trim();
+const idx = (html, label) => html.toLowerCase().indexOf(String(label).toLowerCase());
+const sliceWin = (html, start, win = 500) =>
+  compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
+
 const findAfter = (html, label, { allowPercent = false, window = 400 } = {}) => {
-  const i = html.toLowerCase().indexOf(label.toLowerCase());
+  const i = idx(html, label);
   if (i < 0) return null;
-  const slice = html.slice(i, i + window).replace(/\s+/g, " ");
-  let re = allowPercent
+  const s = sliceWin(html, i, window);
+  const re = allowPercent
     ? /-?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*%/
     : /-?\d{1,3}(?:,\d{3})*(?:\.\d+)?/;
-  const m = slice.match(re);
+  const m = s.match(re);
   return m ? toNum(m[0]) : null;
 };
-const findRowTriplet = (html, label, window = 220) => {
-  const i = html.toLowerCase().indexOf(label.toLowerCase());
+const findPercentThenNums = (html, start, label) => {
+  const i = idx(html, label);
+  if (i < 0) return { pct: null, nums: [] };
+  let s = sliceWin(html, i, 360);
+  const pm = s.match(/-?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*%/);
+  const pct = pm ? toNum(pm[0]) : null;
+  if (pm) s = s.replace(pm[0], ""); // پاک کن تا در لیست اعداد نیاید
+  const nums = (s.match(/-?\d{1,3}(?:,\d{3})*(?:\.\d+)?/g) || []).map(toNum);
+  return { pct, nums };
+};
+const findTripletRow = (html, label) => {
+  const i = idx(html, label);
   if (i < 0) return null;
-  const slice = html.slice(i, i + window).replace(/\s+/g, " ");
-  const nums = slice.match(/-?\d{1,3}(?:,\d{3})*(?:\.\d+)?/g) || [];
-  const [a, b, c] = nums.slice(0, 3).map(toNum);
-  if ([a, b, c].some((x) => x == null)) return null;
+  const s = sliceWin(html, i, 220);
+  const nums = (s.match(/-?\d{1,3}(?:,\d{3})*(?:\.\d+)?/g) || []).map(toNum);
+  if (nums.length < 3) return null;
+  const [a, b, c] = nums;
   return { a, b, c };
 };
 const findHistory = (html) => {
-  const i = html.toLowerCase().indexOf("history");
+  const i = idx(html, "History");
   if (i < 0) return null;
-  const slice = html.slice(i, i + 200).replace(/\s+/g, " ");
-  const m = slice.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
-  if (!m) return null;
-  return { value: toNum(m[1]), unit: String(m[2]).toLowerCase() };
+  const s = sliceWin(html, i, 200);
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+  return m ? { value: toNum(m[1]), unit: String(m[2]).toLowerCase() } : null;
 };
 const findCurrency = (html) => {
-  const i = html.toLowerCase().indexOf("currency");
+  const i = idx(html, "Currency");
   if (i < 0) return null;
-  const slice = html.slice(i, i + 120);
-  const m = slice.match(/\b([A-Z]{3,4})\b/);
+  const s = html.slice(i, i + 120);
+  const m = s.match(/\b([A-Z]{3,4})\b/);
   return m ? m[1] : null;
 };
 
+/* ---------------- scraper ---------------- */
 async function scrapeFxBlueStats(user) {
   const url = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
-  const { data: html } = await http.get(url);
+  const { data: htmlRaw } = await http.get(url);
+  const html = String(htmlRaw);
 
+  // ----- Overview -----
   const overview = {
     weeklyReturn: findAfter(html, "Weekly return", { allowPercent: true }),
     monthlyReturn: findAfter(html, "Monthly return", { allowPercent: true }),
@@ -76,6 +91,7 @@ async function scrapeFxBlueStats(user) {
     floatingPL: findAfter(html, "Floating P/L"),
   };
 
+  // ----- Returns -----
   const returns = {
     totalReturn: findAfter(html, "Total return", { allowPercent: true }),
     bankedReturn: findAfter(html, "Banked return", { allowPercent: true }),
@@ -84,38 +100,90 @@ async function scrapeFxBlueStats(user) {
     perMonth: findAfter(html, "Per month", { allowPercent: true }),
   };
 
-  const depCredits = findRowTriplet(html, "Credits");
-  const depTotals = findRowTriplet(html, "Total");
-  // "Banked trades" row contains Profit / Loss / Net
-  const bankedPL = findRowTriplet(html, "Banked trades");
-  const openPL = findRowTriplet(html, "Open trades");
-
+  // ----- Deposits / Profit & Loss -----
+  const credits = findTripletRow(html, "Credits");
+  const totals = findTripletRow(html, "Total");
+  const bankedPL = findTripletRow(html, "Banked trades");
+  const openPL = findTripletRow(html, "Open trades");
   const deposits = {
-    credits: depCredits
-      ? { deposits: depCredits.a, withdrawals: depCredits.b, net: depCredits.c }
+    credits: credits
+      ? { deposits: credits.a, withdrawals: credits.b, net: credits.c }
       : null,
-    bankedTrades: bankedPL
-      ? { profit: bankedPL.a, loss: bankedPL.b, net: bankedPL.c }
-      : null,
-    openTrades: openPL
-      ? { profit: openPL.a, loss: openPL.b, net: openPL.c }
-      : null,
-    total: depTotals
-      ? { deposits: depTotals.a, withdrawals: depTotals.b, net: depTotals.c }
-      : null,
+    bankedTrades: bankedPL ? { profit: bankedPL.a, loss: bankedPL.b, net: bankedPL.c } : null,
+    openTrades: openPL ? { profit: openPL.a, loss: openPL.b, net: openPL.c } : null,
+    total: totals ? { deposits: totals.a, withdrawals: totals.b, net: totals.c } : null,
   };
+
+  // ----- Banked profits per day/week/month/trade -----
+  const bankedProfits = (() => {
+    const baseIdx = idx(html, "Banked profits per day/week/month/trade");
+    if (baseIdx < 0) return null;
+    const rows = {};
+    const parseRow = (label) => {
+      const { pct, nums } = findPercentThenNums(html.slice(baseIdx), label);
+      // بعد از حذف درصد، انتظار: winning, losing, best, worst, bestSeq, worstSeq
+      const [winning, losing, best, worst, bestSeq, worstSeq] = nums;
+      return {
+        winning: winning ?? null,
+        losing: losing ?? null,
+        winLossPct: pct ?? null,
+        best: best ?? null,
+        worst: worst ?? null,
+        bestSeq: bestSeq ?? null,
+        worstSeq: worstSeq ?? null,
+      };
+    };
+    rows.days = parseRow("Days");
+    rows.weeks = parseRow("Weeks");
+    rows.months = parseRow("Months");
+    rows.closedTrades = parseRow("Closed trades");
+    return rows;
+  })();
+
+  // ----- Stats on closed trades -----
+  const closedStats = (() => {
+    const baseIdx = idx(html, "Stats on closed trades");
+    if (baseIdx < 0) return null;
+    const block = html.slice(baseIdx, baseIdx + 2000);
+    const parseRow = (label) => {
+      // ترتیب ستون‌ها در اسکرین‌شات: Trades, Profit, Avg cash, Avg pips, Avg length, Cash/hr, Pips/hr, Long seq
+      const i = idx(block, label);
+      if (i < 0) return null;
+      const s = compact(block.slice(i, i + 420));
+      const nums = (s.match(/-?\d{1,3}(?:,\d{3})*(?:\.\d+)?/g) || []).map(toNum);
+      if (nums.length < 8) return null;
+      const [trades, profit, avgCash, avgPips, avgLen, cashHr, pipsHr, longSeq] = nums;
+      return {
+        trades,
+        profit,
+        avgCash,
+        avgPips,
+        avgLengthHours: avgLen,
+        cashPerHour: cashHr,
+        pipsPerHour: pipsHr,
+        longSeq,
+      };
+    };
+    return {
+      winners: parseRow("Winners"),
+      losers: parseRow("Losers"),
+      all: parseRow("All trades"),
+    };
+  })();
 
   return {
     user,
     overview,
     returns,
     deposits,
+    bankedProfits,
+    closedStats,
     source: "fxblue-scrape",
     fetchedAt: Date.now(),
   };
 }
 
-// ---- REST ----
+/* ---------------- REST ---------------- */
 app.get("/api/fxblue/stats", async (req, res) => {
   try {
     const u = String(req.query.u || "").trim();
@@ -127,11 +195,6 @@ app.get("/api/fxblue/stats", async (req, res) => {
   }
 });
 
-// keepalive / health
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-app.listen(PORT, () => {
-  console.log("FXB API on :" + PORT);
-});
+app.listen(PORT, () => console.log("FXB API on :" + PORT));
