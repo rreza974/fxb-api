@@ -1,15 +1,17 @@
 // server.js — FXB API (Render/Node18)
 // اسکرپ FXBlue: /users/<u>/stats + فالو‌بک از /users/<u>
-// خروجی شامل: overview.{weeklyReturn,monthlyReturn,profitFactor,peakDrawdown,history,accountType}
-// returns.* و deposits.* هم برگردانده می‌شود.
+// برمی‌گرداند: overview.{weeklyReturn,monthlyReturn,profitFactor,peakDrawdown,history,accountType}
+// به‌همراه: returns.{totalReturn,perDay,perWeek,perMonth} و deposits (credits/banked/open/total)
+
 const express = require("express");
-const axios = require("axios");
-const cors = require("cors");
+const axios   = require("axios");
+const cors    = require("cors");
+
 const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-/* ------------ HTTP ------------ */
+/* ---------------- HTTP client ---------------- */
 const http = axios.create({
   timeout: 25000,
   headers: {
@@ -20,7 +22,7 @@ const http = axios.create({
   },
 });
 
-/* ------------ helpers ------------ */
+/* ---------------- helpers ---------------- */
 const decodeHTML = (s = "") =>
   s
     .replace(/&nbsp;/g, " ")
@@ -43,12 +45,9 @@ const toNum = (s) => {
 };
 
 const stripTags = (s) => String(s).replace(/<[^>]+>/g, "");
-const compact = (s) =>
-  decodeHTML(String(s)).replace(/[\u00A0]/g, " ").replace(/\s+/g, " ").trim();
-const idx = (html, label) =>
-  html.toLowerCase().indexOf(String(label).toLowerCase());
-const sliceWin = (html, start, win = 1600) =>
-  compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
+const compact   = (s) => decodeHTML(String(s)).replace(/[\u00A0]/g, " ").replace(/\s+/g, " ").trim();
+const idx       = (html, label) => html.toLowerCase().indexOf(String(label).toLowerCase());
+const sliceWin  = (html, start, win = 1600) => compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
 function findAfter(html, label, { allowPercent = false, window = 1000 } = {}) {
   const i = idx(html, label);
@@ -78,15 +77,18 @@ function extractRowsFromTable(tableHtml) {
   }
   return rows;
 }
+
 function extractAllTables(html) {
   const out = [];
-  const tableRe = /<table\b[\س\S]*?<\/table>/gi;
-  const headingRe = /<h[1-6][^>]*>([\س\S]*?)<\/h[1-6]>/gi;
-  const captionRe = /<caption[^>]*>([\س\S]*?)<\/caption>/i;
+  const tableRe   = /<table\b[\s\S]*?<\/table>/gi;
+  const headingRe = /<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi;
+  const captionRe = /<caption[^>]*>([\s\S]*?)<\/caption>/i;
+
   const matches = Array.from(html.matchAll(tableRe));
   for (const m of matches) {
     const tableHtml = m[0];
     const start = m.index || 0;
+
     const cap = tableHtml.match(captionRe);
     let title = null;
     if (cap && cap[1]) title = compact(stripTags(cap[1]));
@@ -95,8 +97,10 @@ function extractAllTables(html) {
       const heads = Array.from(prev.matchAll(headingRe));
       if (heads.length) title = compact(stripTags(heads[heads.length - 1][1]));
     }
+
     const rows = extractRowsFromTable(tableHtml);
     if (!rows.length) continue;
+
     const headerGuess =
       /<th\b/i.test(tableHtml) || rows[0].every((c) => isNaN(parseFloat(c)));
     let headers = [];
@@ -110,6 +114,7 @@ function extractAllTables(html) {
   out.sort((a, b) => a.index - b.index);
   return out;
 }
+
 function findRow(rows, re) {
   const R = typeof re === "string" ? new RegExp("^" + re + "$", "i") : re;
   return rows.find((r) => r[0] && R.test(r[0])) || null;
@@ -142,9 +147,9 @@ function findHistoryFrom(rows) {
   return null;
 }
 
-/* --- استخراج بسیار مقاوم Account type --- */
+/* --- استخراج بسیار مقاوم نوع حساب (Demo/Real) --- */
 function extractAccountType(html, rows) {
-  // ۱) اگر در ساختار جدولی/ردیفی آمده باشد
+  // ۱) اگر در جدول/ردیف آمده باشد
   const r = findRow(rows, /account\s*type/i);
   if (r) {
     const val = (r.slice(1).join(" ") || "").toLowerCase();
@@ -152,19 +157,17 @@ function extractAccountType(html, rows) {
     if (/\breal\b/.test(val)) return "real";
   }
 
-  // ۲) روی HTML خام:  «Account type : [تیک/آیکن/اسپن] Demo»
-  //   - بین Account و type همه‌چیز (اسپیس، &nbsp;، تگ)
-  //   - بین : تا Demo/Real هم هرچیز حداکثر 200 کاراکتر
-  const rx = /Account(?:\s|&nbsp;|<[^>]*>)*type\s*:([\s\S]{0,200}?)(Demo|Real)\b/i;
+  // ۲) روی HTML خام با فاصله/تگ/ایموجی بین «Account type :» و مقدار
+  const rx = /Account(?:\s|&nbsp;|<[^>]*>)*type\s*:\s*([\s\S]{0,200}?)(Demo|Real)\b/i;
   let m = html.match(rx);
   if (m && m[2]) return m[2].toLowerCase();
 
-  // ۳) روی نسخهٔ متنیِ بدون تگ: «Account type :  Demo»
+  // ۳) روی نسخهٔ متنیِ صاف
   const plain = stripTags(decodeHTML(html));
   m = plain.match(/Account\s*type\s*:\s*(Demo|Real)\b/i);
   if (m && m[1]) return m[1].toLowerCase();
 
-  // ۴) اگر جایی نزدیک برچسب باشد (همچنان در HTML خام)
+  // ۴) نزدیک برچسب در HTML خام (پنجره‌ی بزرگ)
   const i = idx(html, "Account type");
   if (i >= 0) {
     const win = sliceWin(html, i, 2000);
@@ -172,7 +175,7 @@ function extractAccountType(html, rows) {
     if (/Real\b/i.test(win)) return "real";
   }
 
-  // ۵) فالو‌بکِ ساده: اگر کلمهٔ Demo/Real در صفحه باشد
+  // ۵) فالو‌بک: اگر در صفحه واژه Demo/Real دیده شود
   if (/\bDemo\b/i.test(plain)) return "demo";
   if (/\bReal\b/i.test(plain)) return "real";
 
@@ -181,19 +184,19 @@ function extractAccountType(html, rows) {
 
 /* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
-  // /stats
+  // صفحه Stats
   const statsUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
   const { data: statsHtmlRaw } = await http.get(statsUrl);
-  const statsHtml = String(statsHtmlRaw);
+  const statsHtml   = String(statsHtmlRaw);
   const statsTables = extractAllTables(statsHtml);
-  const statsRows = statsTables.flatMap((t) => t.rows);
+  const statsRows   = statsTables.flatMap((t) => t.rows);
 
-  // /users/<u>
+  // صفحه Overview
   const overviewUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}`;
   const { data: ovHtmlRaw } = await http.get(overviewUrl);
-  const ovHtml = String(ovHtmlRaw);
+  const ovHtml   = String(ovHtmlRaw);
   const ovTables = extractAllTables(ovHtml);
-  const ovRows = ovTables.flatMap((t) => t.rows);
+  const ovRows   = ovTables.flatMap((t) => t.rows);
 
   // Overview metrics
   let weeklyReturn =
@@ -235,11 +238,9 @@ async function scrapeFxBlueStats(user) {
       return null;
     })();
 
-  // Account type (robust)
+  // نوع حساب (بسیار مقاوم)
   const accountType =
-    extractAccountType(ovHtml, ovRows) ??
-    extractAccountType(statsHtml, statsRows) ||
-    null; // 'demo' | 'real' | null
+    (extractAccountType(ovHtml, ovRows) ?? extractAccountType(statsHtml, statsRows)) || null; // 'demo' | 'real' | null
 
   // Returns
   const totalReturn =
@@ -264,7 +265,7 @@ async function scrapeFxBlueStats(user) {
     if (!r) return null;
     const nums = r.slice(1).map(toNum).filter((x) => x != null);
     if (nums.length < 3) return null;
-    return { a: nums[0], b: nums[1], c: nums[2] };
+    return { a: nums[0], b: nums[1], c: nums[2] }; // a=Deposits/Profit, b=Withdrawals/Loss, c=Net
   };
   const credits = trip(statsRows, /^credits$/i);
   const banked  = trip(statsRows, /banked trades?/i);
@@ -276,7 +277,7 @@ async function scrapeFxBlueStats(user) {
     overview: {
       weeklyReturn, monthlyReturn, profitFactor, peakDrawdown, history, accountType
     },
-    returns: { totalReturn, bankedReturn, perDay, perWeek, perMonth },
+    returns: { totalReturn, perDay, perWeek, perMonth, bankedReturn },
     deposits: {
       credits: credits ? { deposits: credits.a, withdrawals: credits.b, net: credits.c } : null,
       bankedTrades: banked ? { profit: banked.a, loss: banked.b, net: banked.c } : null,
@@ -288,7 +289,7 @@ async function scrapeFxBlueStats(user) {
   };
 }
 
-/* ------------ REST ------------ */
+/* ---------------- REST ---------------- */
 app.get("/api/fxblue/stats", async (req, res) => {
   try {
     const u = String(req.query.u || "").trim();
@@ -299,5 +300,7 @@ app.get("/api/fxblue/stats", async (req, res) => {
     res.status(500).json({ error: true, message: e.message || "scrape error" });
   }
 });
+
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+
 app.listen(PORT, () => console.log("FXB API on :" + PORT));
