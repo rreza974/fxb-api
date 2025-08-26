@@ -1,6 +1,7 @@
 // server.js — FXB API (Render/Node18)
-// اسکرپ FXBlue/Stats + فالو‌بک از صفحه‌ی اصلی برای Peak drawdown
-// ⚠️ این نسخه «History» را هم از /users/<u>/stats می‌خواند (و در صورت نیاز از صفحه‌ی اصلی).
+// اسکرپ FXBlue: /users/<u>/stats + فالو‌بک از /users/<u>
+// خروجی شامل: overview.weeklyReturn/monthlyReturn/profitFactor/peakDrawdown/history/accountType
+// و returns.totalReturn/perDay/perWeek/perMonth + deposits (credits/banked/open/total)
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -126,14 +127,12 @@ function findLabeledNumber(rows, labelRe) {
   return v == null ? null : toNum(v);
 }
 function findHistoryFrom(rows) {
-  // ۱) اگر ردیفی با عنوان History بود
   const r = findRow(rows, /history/i);
   if (r) {
     const joined = r.slice(1).join(" ") || r[0] || "";
-    const m = String(joined).match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+    const m = joined.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
     if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
   }
-  // ۲) در غیر این صورت، همه سلول‌ها را اسکن کن
   for (const rr of rows) {
     for (const c of rr) {
       const m = String(c).match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
@@ -145,21 +144,21 @@ function findHistoryFrom(rows) {
 
 /* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
-  // 1) صفحه Stats
+  // 1) /stats
   const statsUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
   const { data: statsHtmlRaw } = await http.get(statsUrl);
   const statsHtml = String(statsHtmlRaw);
   const statsTables = extractAllTables(statsHtml);
   const statsRows = statsTables.flatMap((t) => t.rows);
 
-  // 2) صفحه Overview اصلی (برای فالو‌بکِ Peak drawdown/History)
+  // 2) /users/<u> (Overview)
   const overviewUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}`;
   const { data: ovHtmlRaw } = await http.get(overviewUrl);
   const ovHtml = String(ovHtmlRaw);
   const ovTables = extractAllTables(ovHtml);
   const ovRows = ovTables.flatMap((t) => t.rows);
 
-  // ---- Overview fields
+  // Overview metrics
   let weeklyReturn =
     findLabeledPercent(statsRows, /weekly return/i) ??
     findAfter(statsHtml, "Weekly return", { allowPercent: true });
@@ -171,7 +170,6 @@ async function scrapeFxBlueStats(user) {
     findLabeledNumber(statsRows, /profit factor/i) ??
     findAfter(statsHtml, "Profit factor");
 
-  // Peak drawdown: اول از صفحه Stats، اگر نبود از صفحه Overview
   let peakDrawdown =
     findLabeledPercent(statsRows, /peak drawdown/i) ??
     findAfter(statsHtml, "Peak drawdown", { allowPercent: true }) ??
@@ -179,25 +177,37 @@ async function scrapeFxBlueStats(user) {
     findAfter(ovHtml, "Peak drawdown", { allowPercent: true });
   if (typeof peakDrawdown === "number") peakDrawdown = -Math.abs(peakDrawdown);
 
-  // History: اول از جدول‌های صفحه Stats، اگر نبود از صفحه Overview، و در نهایت جستجوی ساده نزدیک برچسب
-  let history =
+  const history =
     findHistoryFrom(statsRows) ??
     findHistoryFrom(ovRows) ??
     (function () {
       const i = idx(statsHtml, "History");
       if (i >= 0) {
-        const s = sliceWin(statsHtml, i, 400);
-        const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
-        if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+        const s = sliceWin(statsHtml, i, 400).match(
+          /(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i
+        );
+        if (s) return { value: toNum(s[1]), unit: s[2].toLowerCase() };
       }
       const j = idx(ovHtml, "History");
       if (j >= 0) {
-        const s = sliceWin(ovHtml, j, 400);
-        const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
-        if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+        const s = sliceWin(ovHtml, j, 400).match(
+          /(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i
+        );
+        if (s) return { value: toNum(s[1]), unit: s[2].toLowerCase() };
       }
       return null;
     })();
+
+  // Account type: Demo/Real (از صفحه اصلی)
+  let accountType = null;
+  {
+    const i = idx(ovHtml, "Account type");
+    if (i >= 0) {
+      const s = sliceWin(ovHtml, i, 220);
+      const m = s.match(/\b(Demo|Real)\b/i);
+      if (m) accountType = m[1].toLowerCase(); // 'demo' | 'real'
+    }
+  }
 
   // Returns
   const totalReturn =
@@ -216,19 +226,18 @@ async function scrapeFxBlueStats(user) {
     findLabeledPercent(statsRows, /per month/i) ??
     findAfter(statsHtml, "Per month", { allowPercent: true });
 
-  // Deposits / Profit & Loss (از جدول‌ها)
-  const triplet = (rows, label) => {
-    const r = findRow(rows, label);
+  // Deposits / Profit & Loss
+  const trip = (rows, re) => {
+    const r = rows.find((x) => re.test(x[0] || ""));
     if (!r) return null;
     const nums = r.slice(1).map(toNum).filter((x) => x != null);
     if (nums.length < 3) return null;
     return { a: nums[0], b: nums[1], c: nums[2] };
-    // a=Deposits/Profit, b=Withdrawals/Loss, c=Net
   };
-  const credits = triplet(statsRows, /^credits$/i);
-  const banked  = triplet(statsRows, /banked trades?/i);
-  const open    = triplet(statsRows, /open trades?/i);
-  const totals  = triplet(statsRows, /^total$/i);
+  const credits = trip(statsRows, /^credits$/i);
+  const banked = trip(statsRows, /banked trades?/i);
+  const open = trip(statsRows, /open trades?/i);
+  const totals = trip(statsRows, /^total$/i);
 
   return {
     user,
@@ -237,20 +246,23 @@ async function scrapeFxBlueStats(user) {
       monthlyReturn,
       profitFactor,
       peakDrawdown,
-      history,            // ⬅️ اضافه شد: { value, unit }
+      history,
+      accountType, // demo|real|null
     },
-    returns: {
-      totalReturn,
-      bankedReturn,
-      perDay,
-      perWeek,
-      perMonth,
-    },
+    returns: { totalReturn, bankedReturn, perDay, perWeek, perMonth },
     deposits: {
-      credits: credits ? { deposits: credits.a, withdrawals: credits.b, net: credits.c } : null,
-      bankedTrades: banked ? { profit: banked.a, loss: banked.b, net: banked.c } : null,
-      openTrades: open ? { profit: open.a, loss: open.b, net: open.c } : null,
-      total: totals ? { deposits: totals.a, withdrawals: totals.b, net: totals.c } : null,
+      credits: credits
+        ? { deposits: credits.a, withdrawals: credits.b, net: credits.c }
+        : null,
+      bankedTrades: banked
+        ? { profit: banked.a, loss: banked.b, net: banked.c }
+        : null,
+      openTrades: open
+        ? { profit: open.a, loss: open.b, net: open.c }
+        : null,
+      total: totals
+        ? { deposits: totals.a, withdrawals: totals.b, net: totals.c }
+        : null,
     },
     source: "fxblue-scrape",
     fetchedAt: Date.now(),
