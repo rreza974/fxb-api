@@ -1,6 +1,6 @@
 // server.js — FXB API (Render/Node18)
 // اسکرپ FXBlue: /users/<u>/stats + فالو‌بک از /users/<u>
-// خروجی شامل: overview.weeklyReturn/monthlyReturn/profitFactor/peakDrawdown/history/accountType
+// خروجی شامل: overview.{weeklyReturn,monthlyReturn,profitFactor,peakDrawdown,history,accountType}
 // returns.* و deposits.* هم برگردانده می‌شود.
 const express = require("express");
 const axios = require("axios");
@@ -47,7 +47,7 @@ const compact = (s) =>
   decodeHTML(String(s)).replace(/[\u00A0]/g, " ").replace(/\s+/g, " ").trim();
 const idx = (html, label) =>
   html.toLowerCase().indexOf(String(label).toLowerCase());
-const sliceWin = (html, start, win = 1400) =>
+const sliceWin = (html, start, win = 1600) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
 function findAfter(html, label, { allowPercent = false, window = 1000 } = {}) {
@@ -142,27 +142,31 @@ function findHistoryFrom(rows) {
   return null;
 }
 
-/* --- استخراج مقاوم Account type --- */
-function guessAccountTypeFrom(html, rows) {
-  // ۱) اگر در جدول آمده باشد
+/* --- استخراج بسیار مقاوم Account type --- */
+function extractAccountType(html, rows) {
+  // ۱) اگر در جدول/ردیف باشد
   const r = findRow(rows, /account\s*type/i);
   if (r) {
-    const text = (r.slice(1).join(" ") || r[0] || "").toLowerCase();
-    if (/\bdemo\b/i.test(text)) return "demo";
-    if (/\breal\b/i.test(text)) return "real";
+    const val = (r.slice(1).join(" ") || "").toLowerCase();
+    if (/demo/.test(val)) return "demo";
+    if (/real/.test(val)) return "real";
   }
-  // ۲) جست‌وجو در متنِ صفحه (پس از حذف تگ‌ها)
-  const plain = compact(stripTags(html)).toLowerCase();
-  let m = plain.match(/account\s*type\s*:\s*(demo|real)/i);
+  // ۲) متنِ سادهٔ کل صفحه
+  const plain = compact(stripTags(html));
+  // حالت «Account type: ✅ Demo» یا با کاراکترهای غیرحرفی بین‌شان:
+  let m = plain.match(/account\s*type\s*:\s*[^A-Za-z]{0,8}\s*(demo|real)/i);
   if (m && m[1]) return m[1].toLowerCase();
-  // ۳) نزدیک‌محله‌ی برچسب در HTML خام
+  // حالتِ بدون کالن یا فاصله زیاد
+  m = plain.match(/account\s*type[^A-Za-z]{0,20}(demo|real)/i);
+  if (m && m[1]) return m[1].toLowerCase();
+  // ۳) نزدیک برچسب در HTML خام (با تگ‌ها)
   const i = idx(html, "Account type");
   if (i >= 0) {
-    const win = sliceWin(html, i, 1600); // پنجره بزرگ
+    const win = sliceWin(html, i, 1600);
     if (/demo/i.test(win)) return "demo";
     if (/real/i.test(win)) return "real";
   }
-  // ۴) فالو‌بک ساده
+  // ۴) فالو‌بک: اگر جایی در صفحه « Demo »/« Real » باشد
   if (/\bdemo\b/i.test(plain)) return "demo";
   if (/\breal\b/i.test(plain)) return "real";
   return null;
@@ -226,8 +230,8 @@ async function scrapeFxBlueStats(user) {
 
   // Account type (robust)
   const accountType =
-    guessAccountTypeFrom(ovHtml, ovRows) ??
-    guessAccountTypeFrom(statsHtml, statsRows) ||
+    extractAccountType(ovHtml, ovRows) ??
+    extractAccountType(statsHtml, statsRows) ||
     null; // 'demo' | 'real' | null
 
   // Returns
