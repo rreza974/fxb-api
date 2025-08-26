@@ -1,4 +1,6 @@
-// server.js — FXB API (Render/Node18) — اسکرپ FXBlue/Stats + فالو‌بک از صفحه اصلی برای Peak drawdown (همیشه با علامت منفی)
+// server.js — FXB API (Render/Node18)
+// اسکرپ FXBlue/Stats + فالو‌بک از صفحه‌ی اصلی برای Peak drawdown
+// ⚠️ این نسخه «History» را هم از /users/<u>/stats می‌خواند (و در صورت نیاز از صفحه‌ی اصلی).
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -6,6 +8,7 @@ const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
+/* ---------------- HTTP client ---------------- */
 const http = axios.create({
   timeout: 25000,
   headers: {
@@ -16,6 +19,7 @@ const http = axios.create({
   },
 });
 
+/* ---------------- helpers ---------------- */
 const decodeHTML = (s = "") =>
   s
     .replace(/&nbsp;/g, " ")
@@ -56,6 +60,7 @@ function findAfter(html, label, { allowPercent = false, window = 600 } = {}) {
   return m ? toNum(m[0]) : null;
 }
 
+/* ---- table parsing ---- */
 function extractRowsFromTable(tableHtml) {
   const rows = [];
   const trRe = /<tr\b[\s\S]*?<\/tr>/gi;
@@ -72,7 +77,6 @@ function extractRowsFromTable(tableHtml) {
   }
   return rows;
 }
-
 function extractAllTables(html) {
   const out = [];
   const tableRe = /<table\b[\s\S]*?<\/table>/gi;
@@ -105,7 +109,6 @@ function extractAllTables(html) {
   out.sort((a, b) => a.index - b.index);
   return out;
 }
-
 function findRow(rows, re) {
   const R = typeof re === "string" ? new RegExp("^" + re + "$", "i") : re;
   return rows.find((r) => r[0] && R.test(r[0])) || null;
@@ -122,7 +125,25 @@ function findLabeledNumber(rows, labelRe) {
   const v = r[1] ?? r[0] ?? null;
   return v == null ? null : toNum(v);
 }
+function findHistoryFrom(rows) {
+  // ۱) اگر ردیفی با عنوان History بود
+  const r = findRow(rows, /history/i);
+  if (r) {
+    const joined = r.slice(1).join(" ") || r[0] || "";
+    const m = String(joined).match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+    if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+  }
+  // ۲) در غیر این صورت، همه سلول‌ها را اسکن کن
+  for (const rr of rows) {
+    for (const c of rr) {
+      const m = String(c).match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+      if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+    }
+  }
+  return null;
+}
 
+/* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
   // 1) صفحه Stats
   const statsUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
@@ -131,7 +152,7 @@ async function scrapeFxBlueStats(user) {
   const statsTables = extractAllTables(statsHtml);
   const statsRows = statsTables.flatMap((t) => t.rows);
 
-  // 2) صفحه Overview اصلی
+  // 2) صفحه Overview اصلی (برای فالو‌بکِ Peak drawdown/History)
   const overviewUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}`;
   const { data: ovHtmlRaw } = await http.get(overviewUrl);
   const ovHtml = String(ovHtmlRaw);
@@ -150,15 +171,33 @@ async function scrapeFxBlueStats(user) {
     findLabeledNumber(statsRows, /profit factor/i) ??
     findAfter(statsHtml, "Profit factor");
 
-  // Peak drawdown: اول از صفحه Stats، اگر نبود از صفحه Overview بخوان
+  // Peak drawdown: اول از صفحه Stats، اگر نبود از صفحه Overview
   let peakDrawdown =
     findLabeledPercent(statsRows, /peak drawdown/i) ??
     findAfter(statsHtml, "Peak drawdown", { allowPercent: true }) ??
     findLabeledPercent(ovRows, /peak drawdown/i) ??
     findAfter(ovHtml, "Peak drawdown", { allowPercent: true });
-
-  // اگر Peak drawdown پیدا شد، همیشه منفی‌اش کن (برای نمایش «-99.7%»)
   if (typeof peakDrawdown === "number") peakDrawdown = -Math.abs(peakDrawdown);
+
+  // History: اول از جدول‌های صفحه Stats، اگر نبود از صفحه Overview، و در نهایت جستجوی ساده نزدیک برچسب
+  let history =
+    findHistoryFrom(statsRows) ??
+    findHistoryFrom(ovRows) ??
+    (function () {
+      const i = idx(statsHtml, "History");
+      if (i >= 0) {
+        const s = sliceWin(statsHtml, i, 400);
+        const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+        if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+      }
+      const j = idx(ovHtml, "History");
+      if (j >= 0) {
+        const s = sliceWin(ovHtml, j, 400);
+        const m = s.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months)/i);
+        if (m) return { value: toNum(m[1]), unit: m[2].toLowerCase() };
+      }
+      return null;
+    })();
 
   // Returns
   const totalReturn =
@@ -184,11 +223,12 @@ async function scrapeFxBlueStats(user) {
     const nums = r.slice(1).map(toNum).filter((x) => x != null);
     if (nums.length < 3) return null;
     return { a: nums[0], b: nums[1], c: nums[2] };
+    // a=Deposits/Profit, b=Withdrawals/Loss, c=Net
   };
   const credits = triplet(statsRows, /^credits$/i);
-  const banked = triplet(statsRows, /banked trades?/i);
-  const open   = triplet(statsRows, /open trades?/i);
-  const totals = triplet(statsRows, /^total$/i);
+  const banked  = triplet(statsRows, /banked trades?/i);
+  const open    = triplet(statsRows, /open trades?/i);
+  const totals  = triplet(statsRows, /^total$/i);
 
   return {
     user,
@@ -196,7 +236,8 @@ async function scrapeFxBlueStats(user) {
       weeklyReturn,
       monthlyReturn,
       profitFactor,
-      peakDrawdown, // مهم
+      peakDrawdown,
+      history,            // ⬅️ اضافه شد: { value, unit }
     },
     returns: {
       totalReturn,
@@ -216,6 +257,7 @@ async function scrapeFxBlueStats(user) {
   };
 }
 
+/* ---------------- REST ---------------- */
 app.get("/api/fxblue/stats", async (req, res) => {
   try {
     const u = String(req.query.u || "").trim();
