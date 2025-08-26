@@ -80,9 +80,9 @@ function extractRowsFromTable(tableHtml) {
 }
 function extractAllTables(html) {
   const out = [];
-  const tableRe = /<table\b[\s\S]*?<\/table>/gi;
-  const headingRe = /<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi;
-  const captionRe = /<caption[^>]*>([\s\S]*?)<\/caption>/i;
+  const tableRe = /<table\b[\س\S]*?<\/table>/gi;
+  const headingRe = /<h[1-6][^>]*>([\س\S]*?)<\/h[1-6]>/gi;
+  const captionRe = /<caption[^>]*>([\س\S]*?)<\/caption>/i;
   const matches = Array.from(html.matchAll(tableRe));
   for (const m of matches) {
     const tableHtml = m[0];
@@ -144,31 +144,38 @@ function findHistoryFrom(rows) {
 
 /* --- استخراج بسیار مقاوم Account type --- */
 function extractAccountType(html, rows) {
-  // ۱) اگر در جدول/ردیف باشد
+  // ۱) اگر در ساختار جدولی/ردیفی آمده باشد
   const r = findRow(rows, /account\s*type/i);
   if (r) {
     const val = (r.slice(1).join(" ") || "").toLowerCase();
-    if (/demo/.test(val)) return "demo";
-    if (/real/.test(val)) return "real";
+    if (/\bdemo\b/.test(val)) return "demo";
+    if (/\breal\b/.test(val)) return "real";
   }
-  // ۲) متنِ سادهٔ کل صفحه
-  const plain = compact(stripTags(html));
-  // حالت «Account type: ✅ Demo» یا با کاراکترهای غیرحرفی بین‌شان:
-  let m = plain.match(/account\s*type\s*:\s*[^A-Za-z]{0,8}\s*(demo|real)/i);
+
+  // ۲) روی HTML خام:  «Account type : [تیک/آیکن/اسپن] Demo»
+  //   - بین Account و type همه‌چیز (اسپیس، &nbsp;، تگ)
+  //   - بین : تا Demo/Real هم هرچیز حداکثر 200 کاراکتر
+  const rx = /Account(?:\s|&nbsp;|<[^>]*>)*type\s*:([\s\S]{0,200}?)(Demo|Real)\b/i;
+  let m = html.match(rx);
+  if (m && m[2]) return m[2].toLowerCase();
+
+  // ۳) روی نسخهٔ متنیِ بدون تگ: «Account type :  Demo»
+  const plain = stripTags(decodeHTML(html));
+  m = plain.match(/Account\s*type\s*:\s*(Demo|Real)\b/i);
   if (m && m[1]) return m[1].toLowerCase();
-  // حالتِ بدون کالن یا فاصله زیاد
-  m = plain.match(/account\s*type[^A-Za-z]{0,20}(demo|real)/i);
-  if (m && m[1]) return m[1].toLowerCase();
-  // ۳) نزدیک برچسب در HTML خام (با تگ‌ها)
+
+  // ۴) اگر جایی نزدیک برچسب باشد (همچنان در HTML خام)
   const i = idx(html, "Account type");
   if (i >= 0) {
-    const win = sliceWin(html, i, 1600);
-    if (/demo/i.test(win)) return "demo";
-    if (/real/i.test(win)) return "real";
+    const win = sliceWin(html, i, 2000);
+    if (/Demo\b/i.test(win)) return "demo";
+    if (/Real\b/i.test(win)) return "real";
   }
-  // ۴) فالو‌بک: اگر جایی در صفحه « Demo »/« Real » باشد
-  if (/\bdemo\b/i.test(plain)) return "demo";
-  if (/\breal\b/i.test(plain)) return "real";
+
+  // ۵) فالو‌بکِ ساده: اگر کلمهٔ Demo/Real در صفحه باشد
+  if (/\bDemo\b/i.test(plain)) return "demo";
+  if (/\bReal\b/i.test(plain)) return "real";
+
   return null;
 }
 
