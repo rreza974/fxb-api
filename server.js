@@ -1,7 +1,6 @@
 // server.js — FXB API (Render/Node18)
 // اسکرپ FXBlue: /users/<u>/stats + فالو‌بک از /users/<u>
-// خروجی شامل: overview.weeklyReturn/monthlyReturn/profitFactor/peakDrawdown/history/accountType
-// و returns.totalReturn/perDay/perWeek/perMonth + deposits (credits/banked/open/total)
+// + استخراج robust برای Account type (Demo/Real)
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -9,7 +8,7 @@ const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-/* ---------------- HTTP client ---------------- */
+/* ------------ HTTP ------------ */
 const http = axios.create({
   timeout: 25000,
   headers: {
@@ -20,7 +19,7 @@ const http = axios.create({
   },
 });
 
-/* ---------------- helpers ---------------- */
+/* ------------ helpers ------------ */
 const decodeHTML = (s = "") =>
   s
     .replace(/&nbsp;/g, " ")
@@ -50,7 +49,8 @@ const idx = (html, label) =>
 const sliceWin = (html, start, win = 1200) =>
   compact(html.slice(Math.max(0, start), Math.max(0, start) + win));
 
-function findAfter(html, label, { allowPercent = false, window = 600 } = {}) {
+function findAfter(html, label, { allowPercent = false, window = 1000 } = {}) {
+  // ⬅️ پنجره را بزرگ‌تر کردیم تا «Demo/Real» داخل محدوده باشد
   const i = idx(html, label);
   if (i < 0) return null;
   const s = sliceWin(html, i, window);
@@ -91,14 +91,14 @@ function extractAllTables(html) {
     let title = null;
     if (cap && cap[1]) title = compact(stripTags(cap[1]));
     else {
-      const prev = html.slice(Math.max(0, start - 1200), start);
+      const prev = html.slice(Math.max(0, start - 1500), start);
       const heads = Array.from(prev.matchAll(headingRe));
       if (heads.length) title = compact(stripTags(heads[heads.length - 1][1]));
     }
     const rows = extractRowsFromTable(tableHtml);
     if (!rows.length) continue;
     const headerGuess =
-      /<th\b/i.test(tableHtml) || rows[0].every((c) => toNum(c) === null && c !== "");
+      /<th\b/i.test(tableHtml) || rows[0].every((c) => isNaN(parseFloat(c)));
     let headers = [];
     let body = rows;
     if (headerGuess) {
@@ -141,17 +141,34 @@ function findHistoryFrom(rows) {
   }
   return null;
 }
+function findAccountType(rows, html){
+  // ۱) از جدول‌ها (اگر «Account type» سطری باشد)
+  const r = findRow(rows, /account\s*type/i);
+  if (r){
+    const text = (r[1] || r[0] || "").toLowerCase();
+    if (/demo/i.test(text)) return "demo";
+    if (/real/i.test(text)) return "real";
+  }
+  // ۲) فالو‌بک: جست‌وجوی آزاد نزدیک «Account type» در HTML
+  const i = idx(html, "Account type");
+  if (i >= 0){
+    const s = sliceWin(html, i, 1000); // ⬅️ پنجرهٔ بزرگ‌تر
+    if (/demo/i.test(s)) return "demo";
+    if (/real/i.test(s)) return "real";
+  }
+  return null;
+}
 
 /* ---------------- SCRAPER ---------------- */
 async function scrapeFxBlueStats(user) {
-  // 1) /stats
+  // /stats
   const statsUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}/stats`;
   const { data: statsHtmlRaw } = await http.get(statsUrl);
   const statsHtml = String(statsHtmlRaw);
   const statsTables = extractAllTables(statsHtml);
   const statsRows = statsTables.flatMap((t) => t.rows);
 
-  // 2) /users/<u> (Overview)
+  // /users/<u>
   const overviewUrl = `https://www.fxblue.com/users/${encodeURIComponent(user)}`;
   const { data: ovHtmlRaw } = await http.get(overviewUrl);
   const ovHtml = String(ovHtmlRaw);
@@ -198,16 +215,10 @@ async function scrapeFxBlueStats(user) {
       return null;
     })();
 
-  // Account type: Demo/Real (از صفحه اصلی)
-  let accountType = null;
-  {
-    const i = idx(ovHtml, "Account type");
-    if (i >= 0) {
-      const s = sliceWin(ovHtml, i, 220);
-      const m = s.match(/\b(Demo|Real)\b/i);
-      if (m) accountType = m[1].toLowerCase(); // 'demo' | 'real'
-    }
-  }
+  // Account type (robust)
+  const accountType =
+    findAccountType(ovRows, ovHtml) ??
+    findAccountType(statsRows, statsHtml) || null; // 'demo' | 'real' | null
 
   // Returns
   const totalReturn =
@@ -235,41 +246,28 @@ async function scrapeFxBlueStats(user) {
     return { a: nums[0], b: nums[1], c: nums[2] };
   };
   const credits = trip(statsRows, /^credits$/i);
-  const banked = trip(statsRows, /banked trades?/i);
-  const open = trip(statsRows, /open trades?/i);
-  const totals = trip(statsRows, /^total$/i);
+  const banked  = trip(statsRows, /banked trades?/i);
+  const open    = trip(statsRows, /open trades?/i);
+  const totals  = trip(statsRows, /^total$/i);
 
   return {
     user,
     overview: {
-      weeklyReturn,
-      monthlyReturn,
-      profitFactor,
-      peakDrawdown,
-      history,
-      accountType, // demo|real|null
+      weeklyReturn, monthlyReturn, profitFactor, peakDrawdown, history, accountType
     },
     returns: { totalReturn, bankedReturn, perDay, perWeek, perMonth },
     deposits: {
-      credits: credits
-        ? { deposits: credits.a, withdrawals: credits.b, net: credits.c }
-        : null,
-      bankedTrades: banked
-        ? { profit: banked.a, loss: banked.b, net: banked.c }
-        : null,
-      openTrades: open
-        ? { profit: open.a, loss: open.b, net: open.c }
-        : null,
-      total: totals
-        ? { deposits: totals.a, withdrawals: totals.b, net: totals.c }
-        : null,
+      credits: credits ? { deposits: credits.a, withdrawals: credits.b, net: credits.c } : null,
+      bankedTrades: banked ? { profit: banked.a, loss: banked.b, net: banked.c } : null,
+      openTrades: open ? { profit: open.a, loss: open.b, net: open.c } : null,
+      total: totals ? { deposits: totals.a, withdrawals: totals.b, net: totals.c } : null,
     },
     source: "fxblue-scrape",
     fetchedAt: Date.now(),
   };
 }
 
-/* ---------------- REST ---------------- */
+/* ------------ REST ------------ */
 app.get("/api/fxblue/stats", async (req, res) => {
   try {
     const u = String(req.query.u || "").trim();
@@ -280,6 +278,5 @@ app.get("/api/fxblue/stats", async (req, res) => {
     res.status(500).json({ error: true, message: e.message || "scrape error" });
   }
 });
-
 app.get("/api/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 app.listen(PORT, () => console.log("FXB API on :" + PORT));
